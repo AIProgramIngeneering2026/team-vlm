@@ -33,7 +33,6 @@
 | `bug` | Исправление ошибок |
 | `refactor` | Рефакторинг существующего кода |
 | `documentation` | Работа с документацией |
-| `technical-task` | Технические и инфраструктурные задачи |
 
 Каждая задача должна содержать:
 
@@ -74,7 +73,7 @@
 **Формат названия ветки:**
 
 ```text
-<type>/<issue-id>-<short-description>
+<type>/<issue-id>
 ```
 
 Где:
@@ -108,19 +107,18 @@
 ### 3.1. Формат коммита
 
 ```text
-<type>(<scope>): <description>
+<type>: <description>
 ```
 
 Где:
 
 - `type` — тип изменения.
-- `scope` — необязательная область проекта, которой касается изменение.
 - `description` — краткое описание изменения.
 
 Пример:
 
 ```text
-feat(auth): add JWT authentication
+feat: add JWT authentication
 ```
 
 ### 3.2. Типы коммитов
@@ -150,11 +148,11 @@ feat(auth): add JWT authentication
 **Примеры:**
 
 ```text
-feat(auth): add JWT authentication
-fix(user): prevent duplicate email registration
+feat: add JWT authentication
+fix: prevent duplicate email registration
 docs: update installation guide
-refactor(api): simplify request validation
-test(auth): add login tests
+refactor: simplify request validation
+test: add login tests
 chore: update dependencies
 ```
 
@@ -186,7 +184,6 @@ chore: update dependencies
 **Автор Pull Request:**
 
 - Предоставляет описание внесённых изменений.
-- Указывает связанную задачу.
 - Отвечает на замечания Reviewer.
 - Вносит необходимые исправления.
 
@@ -195,6 +192,7 @@ chore: update dependencies
 - Проверяет изменения по установленным критериям.
 - Оставляет замечания при обнаружении проблем.
 - Одобряет изменения при отсутствии блокирующих замечаний.
+- Мержит в таргет-ветку.
 
 ## 5. Definition of Done (DoD)
 
