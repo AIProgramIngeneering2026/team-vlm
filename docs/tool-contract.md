@@ -11,14 +11,14 @@ Tool — одна операция оформления открытки (`frame
 ```python
 class Tool(Protocol):
     name: str            # имя операции в API, например "frame"
-    params_schema: dict  # JSON Schema параметров; совпадает со схемой в openapi.yaml
 
     def validate(self, params: dict) -> None:
         """Проверяет параметры. Не смотрит на изображение, не ходит в сеть.
         Raises: InvalidParams(field, reason)."""
 
     def run(self, image: Image, params: dict, ctx: ToolContext) -> ToolResult:
-        """Применяет операцию. Параметры уже проверены через validate."""
+        """При успехе возвращает ToolResult.
+        При ожидаемой ошибке обработки выбрасывает ToolExecutionError."""
 
 
 @dataclass
@@ -30,14 +30,17 @@ class ToolContext:
 
 @dataclass
 class ToolResult:
-    image: Image | None       # результат при успехе
+    image: Image       # результат при успехе
     warnings: list[Warning]   # {code, message}, например geocoder_unavailable
-    error: ToolError | None   # {code, message, details} при отказе
 
     @staticmethod
     def ok(image, warnings=()) -> "ToolResult": ...
-    @staticmethod
-    def fail(code, message, details=None) -> "ToolResult": ...
+
+class ToolExecutionError(Exception):
+    """Ожидаемый отказ при выполнении Tool."""
+    code: str
+    message: str
+    details: dict
 ```
 
 `Image` — внутренний тип ядра (в реализации обёртка над изображением из библиотеки обработки), чтобы интерфейс не зависел
@@ -72,14 +75,15 @@ class Dispatcher:
 Параметры проверяет **Tool, а не вызывающий**: только Tool знает свои ограничения, а Dispatcher о них не знает.
 Вызывающий (JobService) лишь гарантирует, что `validate` вызван для каждой операции до сохранения Job. Поэтому `run` вправе
 считать параметры корректными, а нарушение этого допущения считается программной ошибкой.
-Изображение `run` тоже получает уже проверенным. Если оно не декодируется при выполнении, Tool возвращает `fail("processing_failed", …)`.
+Изображение `run` тоже получает уже проверенным. Если оно не декодируется при выполнении, Tool выбрасывает `ToolExecutionError` с кодом `processing_failed`.
+`Tool.validate()` — единственный исполняемый источник правил валидации параметров в коде. OpenAPI описывает те же ограничения для клиентов API, но не используется для проверки параметров во время выполнения. Тесты проверяют соответствие `Tool.validate()` ограничениям OpenAPI.
 
 ## 3. Ошибки
 
 | Откуда | Как сообщается | Что происходит с Job |
 |---|---|---|
 | `validate` | исключение `InvalidParams(field, reason)` | Job не создаётся, клиент получает `422 invalid_params` |
-| `run`, ожидаемый отказ | `ToolResult.fail("processing_failed", message, details)` | Job → `failed`, `error.code = processing_failed`, в `details` добавляются `operation_index` и `operation` |
+| `run`, ожидаемый отказ | Tool выбрасывает `ToolExecutionError` с кодом `processing_failed` | Job → `failed`, ошибка записывается в `Job.error`; Dispatcher добавляет `operation_index` и `operation` |
 | `run`, неожиданное исключение | перехватывает Dispatcher | Job → `failed`, `error.code = internal_error`, трассировка в логе |
 | Нештатная, но не фатальная ситуация | `ToolResult.ok(image, warnings=[…])` | Job продолжается, предупреждение попадает в `warnings` Job |
 
@@ -134,7 +138,7 @@ class Dispatcher:
 
 ## 6. Как добавить новый Tool
 
-1. Написать класс, реализующий `Tool` (имя, схема, `validate`, `run`) по инвариантам из раздела 4.
+1. Написать класс, реализующий `Tool` (`name`, `validate`, `run`) по инвариантам из раздела 4.
 2. Зарегистрировать его в Registry при сборке приложения.
 3. Добавить схему параметров в `openapi.yaml` (вариант в `oneOf` у `Operation`) и тесты Tool.
 
