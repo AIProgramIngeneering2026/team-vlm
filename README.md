@@ -93,3 +93,42 @@ Dispatcher не знает конкретных Tool. Во втором семе
 ## Запуск
 
 Появится к практике 7: `docker compose up`.
+
+
+## Практика 3: доменное ядро
+
+Python 3.11+ (проверено на 3.14), Pillow 13.0.0. Из корня репозитория:
+
+```sh
+python -m venv .venv
+# Windows PowerShell:
+.venv/Scripts/python -m pip install -r requirements.txt
+.venv/Scripts/python -m unittest discover -s tests -v
+# Linux/macOS: вместо .venv/Scripts/python используйте .venv/bin/python
+```
+
+После установки зависимостей все тесты запускаются одной командой:
+`python -m unittest discover -s tests -v` (в активированном окружении).
+
+Ядро находится в `postcard/`: Job, Registry, Dispatcher, порт JobRepository,
+MemoryJobRepository, общий протокол Tool и два Tool — frame и filter.
+Это реальные операции над пикселями, без HTTP, БД и внешних сервисов.
+Остальные операции из общего описания проекта отложены; Registry сообщает
+о них unknown_operation до создания Job. Параметры проверяют сами Tool.
+
+Переходы Job соответствуют практике 2 и ADR-0005. start допустим только из
+created; finish/fail/restart — из running. Конечные состояния неизменяемы.
+cancel из created сразу отменяет Job, из running устанавливает флаг.
+Dispatcher завершает текущую операцию и подтверждает отмену до следующей
+операции или публикации результата. finish с флагом отмены — явная ошибка.
+Переходы защищены RLock, включая гонку cancel/finish и двойной start.
+При восстановлении сервера до запуска worker вызывается
+Dispatcher.recover_after_restart(): running → failed, код interrupted.
+Это не команда для работающего worker. Хранилище в памяти не переживает
+перезапуск процесса; hook проверен на восстановленном наборе объектов.
+Повторный запуск, retry и delete не входят в контракт проекта.
+
+Добавление Tool: реализовать name/validate/run и зарегистрировать его при
+сборке приложения. Dispatcher менять не требуется. Пример расширения есть
+в test_extension_warnings_and_operation_order. Промежуточные изображения
+остаются только в памяти, Job получает результат исключительно при done.
