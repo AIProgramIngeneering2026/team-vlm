@@ -1,792 +1,1960 @@
-openapi: 3.0.3
-info:
-  title: Postcard Service API
-  version: 0.1.0
-  description: |
-    API сервиса изготовления открыток из фотографий. Клиент загружает изображение и список операций оформления,
-    сервис выполняет их в фоне как задание (Job), клиент проверяет статус и забирает результат.
-
-    **Единый формат ошибок.** Все ответы с кодами 4xx и 5xx имеют тело `{"code": "...", "message": "...", "details": {...}}`.
-    `code` — стабильный машинный код, `message` — пояснение для человека, `details` — поля, зависящие от кода (см. схему `Error`).
-
-    **Лимиты запроса и обработки по умолчанию** (настраиваются конфигурацией): размер файла — до 10 МБ (10 485 760 байт),
-    изображение — до 25 мегапикселей, форматы JPEG и PNG, от 1 до 10 операций в запросе, размер части `operations` — до 16 КБ,
-    время приёма тела запроса — не более 30 секунд. Эти ограничения уменьшают объём дисковых и вычислительных ресурсов,
-    необходимых для обработки одного задания. Отдельные лимиты CPU, памяти и числа одновременно выполняемых заданий
-    этим контрактом не задаются.
-
-    **Корреляция.** Клиент может передать заголовок `X-Correlation-ID`; сервис вернёт его в ответе
-    или сгенерирует свой и запишет во все логи запроса.
-    Идентификатор задания — строка формата `j_` + 32 строчные шестнадцатеричные цифры,
-    например `j_51a0c3e2b7d44f0e9a1b2c3d4e5f6a7b`.
-    Значение, не подходящее под формат, обрабатывается как несуществующее (`404`).
-
-    **Доступ и ограничения частоты.** Аутентификации нет: доступ к заданию определяется знанием его `id`
-    (см. ADR-0004). Ограничение частоты запросов и квоты в первой версии не поддерживаются, поэтому API не возвращает
-    `429 Too Many Requests`. Статус `419` контрактом не используется.
-servers:
-  - url: http://localhost:8000
-tags:
-  - name: jobs
-    description: Задания на изготовление открыток
-  - name: system
-    description: Служебные эндпоинты
-
-paths:
-  /jobs:
-    post:
-      tags: [jobs]
-      operationId: createJob
-      summary: Создать задание на изготовление открытки
-      description: |
-        Повтор с тем же `Idempotency-Key` и тем же содержимым возвращает ранее созданный Job.
-        Привязка ключа к отпечатку запроса и создание Job выполняются атомарно. Если два запроса с одним ключом
-        и одинаковым содержимым поступили одновременно, создаётся ровно один Job: один запрос получает `202`,
-        второй — `200` с тем же Job и заголовком `Idempotent-Replayed: true`. Если запросы с одним ключом имеют
-        разное содержимое, один из них может создать Job, а другой получает `409 idempotency_key_conflict`.
-        Это правило действует в течение срока хранения ключа — 24 часа с момента создания Job.
-
-        **Порядок проверок.** Возвращается первая сработавшая ошибка. При любой ошибке Job не создаётся,
-        а ключ идемпотентности не занимается.
-        1. Заголовок `Idempotency-Key` присутствует и корректен, иначе `400`.
-        2. Тело запроса принимается потоком не дольше 30 секунд, иначе `408`; превышение лимита размера файла
-           или части `operations` прерывает чтение и даёт `413`.
-        3. Ключ уже известен: то же содержимое даёт `200` с существующим Job, другое содержимое даёт `409`.
-        4. Файл является JPEG или PNG, иначе `422 invalid_image`; размер в мегапикселях проверяется
-           по заголовку файла до декодирования, превышение даёт `413`.
-        5. Список операций содержит от 1 до 10 элементов, имена известны, параметры допустимы, иначе `422`.
-
-        **Что считается «тем же содержимым».** Отпечаток запроса — SHA-256 от байтов файла и канонической формы
-        `operations` (ключи объектов отсортированы, пробелы убраны, значения по умолчанию не подставляются).
-        Имя файла и порядок частей multipart на отпечаток не влияют.
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
-        - $ref: '#/components/parameters/CorrelationId'
-      requestBody:
-        required: true
-        content:
-          multipart/form-data:
-            schema:
-              type: object
-              required: [image, operations]
-              properties:
-                image:
-                  type: string
-                  format: binary
-                  description: Исходная фотография, JPEG или PNG
-                operations:
-                  type: array
-                  minItems: 1
-                  maxItems: 10
-                  description: Операции оформления, выполняются по порядку. Передаётся JSON-строкой.
-                  items:
-                    $ref: '#/components/schemas/Operation'
-            encoding:
-              image:
-                contentType: image/jpeg, image/png
-              operations:
-                contentType: application/json
-      responses:
-        '202':
-          description: Job создан и поставлен в очередь
-          headers:
-            Location:
-              description: Адрес созданного задания
-              schema:
-                type: string
-                example: /jobs/j_51a0c3e2b7d44f0e9a1b2c3d4e5f6a7b
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Job'
-              example:
-                id: j_51a0c3e2b7d44f0e9a1b2c3d4e5f6a7b
-                status: created
-                operations:
-                  - operation: resize_crop
-                    params: {format: a6}
-                  - operation: caption
-                    params: {text: С днём рождения!, add_city: true}
-                cancel_requested: false
-                created_at: '2026-11-14T10:15:30Z'
-                started_at: null
-                finished_at: null
-                updated_at: '2026-11-14T10:15:30Z'
-                result_expires_at: null
-                error: null
-                warnings: []
-        '200':
-          description: |
-            Повтор: задание с этим ключом уже существует, содержимое запроса то же. Возвращается существующий Job
-            в его текущем статусе (в том числе `failed` или `cancelled`), новый Job не создаётся.
-          headers:
-            Idempotent-Replayed:
-              description: Всегда `true` для повторного запроса
-              schema:
-                type: string
-                enum: ['true']
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Job'
-        '400':
-          description: Запрос сформирован неверно
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-              examples:
-                missing_idempotency_key:
-                  summary: Нет заголовка Idempotency-Key или он не подходит под формат
-                  value:
-                    code: missing_idempotency_key
-                    message: Idempotency-Key header is required (8-64 chars, A-Z a-z 0-9 _ -)
-                    details: {header: Idempotency-Key}
-                bad_request:
-                  summary: Тело не является корректным multipart, нет части image или operations, operations не JSON
-                  value:
-                    code: bad_request
-                    message: Part "operations" is not valid JSON
-                    details: {field: operations}
-        '408':
-          description: Тело запроса не получено за 30 секунд
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-              example:
-                code: request_timeout
-                message: Request body was not received within 30 seconds
-                details: {timeout_seconds: 30}
-        '409':
-          description: Ключ идемпотентности уже использован с другим содержимым
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-              example:
-                code: idempotency_key_conflict
-                message: Idempotency-Key was already used with a different request
-                details: {}
-        '413':
-          description: Превышен лимит. Чтение тела прерывается, обработка не начинается
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-              examples:
-                file_size:
-                  value:
-                    code: payload_too_large
-                    message: Image is larger than 10485760 bytes
-                    details: {limit: file_size, max: 10485760}
-                megapixels:
-                  value:
-                    code: payload_too_large
-                    message: Image is larger than 25 megapixels
-                    details: {limit: megapixels, max: 25, actual: 48.2}
-                operations_size:
-                  value:
-                    code: payload_too_large
-                    message: Part "operations" is larger than 16384 bytes
-                    details: {limit: operations_size, max: 16384}
-        '422':
-          description: Данные корректны по форме, но недопустимы по смыслу
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-              examples:
-                invalid_image:
-                  summary: Файл не изображение, битый или неподдерживаемый формат
-                  value:
-                    code: invalid_image
-                    message: File is not a valid JPEG or PNG image
-                    details: {reason: not_an_image}
-                unknown_operation:
-                  value:
-                    code: unknown_operation
-                    message: Unknown operation "sparkle"
-                    details:
-                      operation_index: 1
-                      operation: sparkle
-                      available: [resize_crop, frame, caption, filter, stamp]
-                invalid_params:
-                  value:
-                    code: invalid_params
-                    message: Invalid parameter "width" of operation "frame"
-                    details:
-                      operation_index: 0
-                      operation: frame
-                      field: width
-                      reason: must be an integer from 1 to 15
-        '500':
-          $ref: '#/components/responses/InternalError'
-        '503':
-          $ref: '#/components/responses/ServiceUnavailable'
-
-  /jobs/{jobId}:
-    get:
-      tags: [jobs]
-      operationId: getJob
-      summary: Состояние задания
-      description: |
-        Возвращает Job в любом статусе. История задания хранится и после удаления файлов.
-        Любой `id`, которого нет в системе или который не подходит под формат, даёт одинаковый ответ `404`.
-      parameters:
-        - $ref: '#/components/parameters/JobId'
-        - $ref: '#/components/parameters/CorrelationId'
-      responses:
-        '200':
-          description: Текущее состояние
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Job'
-              examples:
-                running:
-                  value:
-                    id: j_51a0c3e2b7d44f0e9a1b2c3d4e5f6a7b
-                    status: running
-                    operations:
-                      - operation: filter
-                        params: {name: sepia}
-                    cancel_requested: false
-                    created_at: '2026-11-14T10:15:30Z'
-                    started_at: '2026-11-14T10:15:31Z'
-                    finished_at: null
-                    updated_at: '2026-11-14T10:15:31Z'
-                    result_expires_at: null
-                    error: null
-                    warnings: []
-                done_with_warning:
-                  value:
-                    id: j_51a0c3e2b7d44f0e9a1b2c3d4e5f6a7b
-                    status: done
-                    operations:
-                      - operation: caption
-                        params: {text: Привет!, add_city: true}
-                    cancel_requested: false
-                    created_at: '2026-11-14T10:15:30Z'
-                    started_at: '2026-11-14T10:15:31Z'
-                    finished_at: '2026-11-14T10:15:42Z'
-                    updated_at: '2026-11-14T10:15:42Z'
-                    result_expires_at: '2026-11-21T10:15:42Z'
-                    error: null
-                    warnings:
-                      - code: geocoder_unavailable
-                        message: City was not added to the caption because the geocoder did not respond
-                failed:
-                  value:
-                    id: j_51a0c3e2b7d44f0e9a1b2c3d4e5f6a7b
-                    status: failed
-                    operations:
-                      - operation: frame
-                        params: {}
-                    cancel_requested: false
-                    created_at: '2026-11-14T10:15:30Z'
-                    started_at: '2026-11-14T10:15:31Z'
-                    finished_at: '2026-11-14T10:15:32Z'
-                    updated_at: '2026-11-14T10:15:32Z'
-                    result_expires_at: null
-                    error:
-                      code: interrupted
-                      message: Service was restarted while the job was running
-                      details: {}
-                    warnings: []
-        '404':
-          $ref: '#/components/responses/JobNotFound'
-        '500':
-          $ref: '#/components/responses/InternalError'
-        '503':
-          $ref: '#/components/responses/ServiceUnavailable'
-
-  /jobs/{jobId}/result:
-    get:
-      tags: [jobs]
-      operationId: getJobResult
-      summary: Забрать готовую открытку
-      description: |
-        Отдаёт PNG, если Job в статусе `done` и срок хранения не истёк. В файле нет метаданных исходника (EXIF, GPS).
-        Размер результата определяет операция `resize_crop`; без неё он равен размеру исходника.
-      parameters:
-        - $ref: '#/components/parameters/JobId'
-        - $ref: '#/components/parameters/CorrelationId'
-      responses:
-        '200':
-          description: Открытка
-          content:
-            image/png:
-              schema:
-                type: string
-                format: binary
-        '404':
-          $ref: '#/components/responses/JobNotFound'
-        '409':
-          description: Результата нет
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-              examples:
-                result_not_ready:
-                  summary: Job в статусе created или running, результат появится позже
-                  value:
-                    code: result_not_ready
-                    message: Result is not ready yet
-                    details: {status: running}
-                result_not_available:
-                  summary: Job в статусе failed или cancelled, результата не будет никогда
-                  value:
-                    code: result_not_available
-                    message: Job ended without a result
-                    details: {status: cancelled}
-        '410':
-          description: Срок хранения истёк, файл удалён
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-              example:
-                code: result_expired
-                message: Result was deleted after the retention period
-                details: {result_expires_at: '2026-11-21T10:15:42Z'}
-        '500':
-          $ref: '#/components/responses/InternalError'
-        '503':
-          $ref: '#/components/responses/ServiceUnavailable'
-
-  /jobs/{jobId}/cancel:
-    post:
-      tags: [jobs]
-      operationId: cancelJob
-      summary: Отменить задание
-      description: |
-        Отмена кооперативная (см. ADR-0005).
-        - Job в статусе `created`: атомарно переходит в `cancelled`, ответ `200`.
-        - Job в статусе `running`: атомарно устанавливается `cancel_requested`, ответ `202`. Dispatcher проверяет
-          этот признак перед каждой операцией и перед фиксацией результата. Уже выполняемая операция доводится до конца;
-          после обнаружения отмены промежуточные данные удаляются, Job переходит в `cancelled`.
-        - Фиксация `cancel_requested` и переход `running → done` синхронизированы атомарно. Если запрос отмены
-          зафиксирован первым, переход в `done` запрещён. Если завершение в `done` зафиксировано первым, отмена
-          получает `409 invalid_transition`. Таким образом, оба перехода одновременно завершиться успешно не могут.
-        - Если во время обработки после принятого запроса отмены возникает ошибка, Job может перейти в `failed`.
-        - Job в конечном статусе (`done`, `failed`, `cancelled`) нельзя отменить: API возвращает `409 invalid_transition`.
-      parameters:
-        - $ref: '#/components/parameters/JobId'
-        - $ref: '#/components/parameters/CorrelationId'
-      responses:
-        '200':
-          description: Job был в `created` и отменён
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Job'
-        '202':
-          description: Job выполняется, отмена запрошена, статус пока `running`
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Job'
-        '404':
-          $ref: '#/components/responses/JobNotFound'
-        '409':
-          description: Отмена из текущего статуса запрещена
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-              example:
-                code: invalid_transition
-                message: Job in status "done" cannot be cancelled
-                details: {from: done, to: cancelled}
-        '500':
-          $ref: '#/components/responses/InternalError'
-        '503':
-          $ref: '#/components/responses/ServiceUnavailable'
-
-  /health:
-    get:
-      tags: [system]
-      operationId: getHealth
-      summary: Проверка работоспособности
-      description: Проверяет доступность базы данных и файлового хранилища.
-      responses:
-        '200':
-          description: Всё работает
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Health'
-              example:
-                status: ok
-                checks: {database: ok, storage: ok}
-        '503':
-          description: Хотя бы одна проверка не пройдена
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Health'
-              example:
-                status: unavailable
-                checks: {database: ok, storage: unavailable}
-
-components:
-  parameters:
-    IdempotencyKey:
-      name: Idempotency-Key
-      in: header
-      required: true
-      description: |
-        Ключ, который клиент генерирует сам (например, UUID) и сохраняет до получения ответа.
-        Повтор запроса с тем же ключом не создаёт новый Job. Ключ помнится 24 часа от создания Job.
-      schema:
-        type: string
-        pattern: '^[A-Za-z0-9_-]{8,64}$'
-        example: 7f3b2c9e-1d4a-4b8e-9c2f-5a6d7e8f9a0b
-    CorrelationId:
-      name: X-Correlation-ID
-      in: header
-      required: false
-      description: Идентификатор для сквозного поиска запроса в логах
-      schema:
-        type: string
-        maxLength: 64
-    JobId:
-      name: jobId
-      in: path
-      required: true
-      description: Идентификатор задания. Значение, не подходящее под формат, обрабатывается как несуществующее (`404`).
-      schema:
-        type: string
-        pattern: '^j_[0-9a-f]{32}$'
-        example: j_51a0c3e2b7d44f0e9a1b2c3d4e5f6a7b
-
-  responses:
-    JobNotFound:
-      description: Задания с таким `id` нет (или `id` некорректен)
-      content:
-        application/json:
-          schema:
-            $ref: '#/components/schemas/Error'
-          example:
-            code: job_not_found
-            message: Job not found
-            details: {}
-    InternalError:
-      description: Непредвиденная ошибка сервиса. Подробности только в логах по correlation ID
-      content:
-        application/json:
-          schema:
-            $ref: '#/components/schemas/Error'
-          example:
-            code: internal_error
-            message: Internal error
-            details: {correlation_id: 3d1c0a52-7c0e-4f55-8d0a-0b1f6a4b2e11}
-    ServiceUnavailable:
-      description: Недоступна база данных или хранилище
-      content:
-        application/json:
-          schema:
-            $ref: '#/components/schemas/Error'
-          example:
-            code: service_unavailable
-            message: Service is temporarily unavailable
-            details: {}
-
-  schemas:
-    Error:
-      type: object
-      required: [code, message, details]
-      properties:
-        code:
-          type: string
-          enum:
-            - bad_request
-            - missing_idempotency_key
-            - request_timeout
-            - job_not_found
-            - result_not_ready
-            - result_not_available
-            - invalid_transition
-            - idempotency_key_conflict
-            - result_expired
-            - payload_too_large
-            - invalid_image
-            - unknown_operation
-            - invalid_params
-            - internal_error
-            - service_unavailable
-        message:
-          type: string
-          description: Пояснение для человека, текст может меняться
-        details:
-          type: object
-          additionalProperties: true
-          description: |
-            Состав зависит от `code`:
-            - `invalid_params`: `operation_index`, `operation`, `field`, `reason`
-              (для ошибок самого списка, например неверного числа операций, `operation_index` нет, `field` равен `operations`);
-            - `unknown_operation`: `operation_index`, `operation`, `available`;
-            - `invalid_image`: `reason` (`not_an_image`, `corrupted`, `unsupported_format`);
-            - `payload_too_large`: `limit` (`file_size`, `megapixels`, `operations_size`), `max`, иногда `actual`;
-            - `invalid_transition`: `from`, `to`;
-            - `result_not_ready`, `result_not_available`: `status`;
-            - `result_expired`: `result_expires_at`;
-            - `idempotency_key_conflict`: пустой объект (`id` существующего задания не раскрывается, см. ADR-0004);
-            - остальные: пустой объект или поле `header` / `field`.
-
-    JobStatus:
-      type: string
-      enum: [created, running, done, failed, cancelled]
-
-    JobError:
-      type: object
-      required: [code, message, details]
-      description: Причина, по которой Job завершился в статусе `failed`
-      properties:
-        code:
-          type: string
-          enum: [processing_failed, storage_error, interrupted, internal_error]
-        message:
-          type: string
-        details:
-          type: object
-          additionalProperties: true
-          description: Для `processing_failed` содержит `operation_index` и `operation`
-
-    JobErrorOrNull:
-      allOf:
-        - $ref: '#/components/schemas/JobError'
-      nullable: true
-      description: `null`, если Job не завершился ошибкой; иначе — объект ошибки.
-
-    Warning:
-      type: object
-      required: [code, message]
-      description: 'Предупреждение: Job выполнен, но часть задуманного не удалось сделать'
-      properties:
-        code:
-          type: string
-          enum: [geocoder_unavailable, location_missing]
-        message:
-          type: string
-
-    Job:
-      type: object
-      required:
-        - id
-        - status
-        - operations
-        - cancel_requested
-        - created_at
-        - started_at
-        - finished_at
-        - updated_at
-        - result_expires_at
-        - error
-        - warnings
-      properties:
-        id:
-          type: string
-          pattern: '^j_[0-9a-f]{32}$'
-        status:
-          $ref: '#/components/schemas/JobStatus'
-        operations:
-          type: array
-          description: Операции в том виде, в котором они приняты
-          items:
-            $ref: '#/components/schemas/Operation'
-        cancel_requested:
-          type: boolean
-          description: '`true`, если клиент запросил отмену выполняющегося Job'
-        created_at:
-          type: string
-          format: date-time
-        started_at:
-          type: string
-          format: date-time
-          nullable: true
-        finished_at:
-          type: string
-          format: date-time
-          nullable: true
-        updated_at:
-          type: string
-          format: date-time
-        result_expires_at:
-          type: string
-          format: date-time
-          nullable: true
-          description: Когда файл результата будет удалён. Заполняется при переходе в `done`
-        error:
-          allOf:
-            - $ref: '#/components/schemas/JobErrorOrNull'
-          nullable: true
-        warnings:
-          type: array
-          items:
-            $ref: '#/components/schemas/Warning'
-
-    Operation:
-      oneOf:
-        - $ref: '#/components/schemas/ResizeCropOperation'
-        - $ref: '#/components/schemas/FrameOperation'
-        - $ref: '#/components/schemas/CaptionOperation'
-        - $ref: '#/components/schemas/FilterOperation'
-        - $ref: '#/components/schemas/StampOperation'
-      discriminator:
-        propertyName: operation
-        mapping:
-          resize_crop: '#/components/schemas/ResizeCropOperation'
-          frame: '#/components/schemas/FrameOperation'
-          caption: '#/components/schemas/CaptionOperation'
-          filter: '#/components/schemas/FilterOperation'
-          stamp: '#/components/schemas/StampOperation'
-
-    ResizeCropOperation:
-      type: object
-      required: [operation]
-      additionalProperties: false
-      properties:
-        operation:
-          type: string
-          enum: [resize_crop]
-        params:
-          $ref: '#/components/schemas/ResizeCropParams'
-    ResizeCropParams:
-      type: object
-      additionalProperties: false
-      properties:
-        format:
-          type: string
-          enum: [a6, a5]
-          default: a6
-          description: a6 — 1748×1240 px, a5 — 2480×1748 px; ориентация выбирается по ориентации фото
-        fit:
-          type: string
-          enum: [crop, pad]
-          default: crop
-          description: crop — обрезка по центру, pad — фото целиком с белыми полями
-
-    FrameOperation:
-      type: object
-      required: [operation]
-      additionalProperties: false
-      properties:
-        operation:
-          type: string
-          enum: [frame]
-        params:
-          $ref: '#/components/schemas/FrameParams'
-    FrameParams:
-      type: object
-      additionalProperties: false
-      properties:
-        style:
-          type: string
-          enum: [thin, classic]
-          default: classic
-        width:
-          type: integer
-          minimum: 1
-          maximum: 15
-          default: 5
-          description: Толщина рамки в процентах от меньшей стороны изображения
-        color:
-          type: string
-          pattern: '^#[0-9A-Fa-f]{6}$'
-          default: '#FFFFFF'
-
-    CaptionOperation:
-      type: object
-      required: [operation, params]
-      additionalProperties: false
-      properties:
-        operation:
-          type: string
-          enum: [caption]
-        params:
-          $ref: '#/components/schemas/CaptionParams'
-    CaptionParams:
-      type: object
-      additionalProperties: false
-      required: [text]
-      properties:
-        text:
-          type: string
-          maxLength: 100
-          description: |
-            Кириллица, латиница, цифры, пробелы и знаки препинания. Можно передать пустую строку, если `add_city` равен `true`.
-            Если текст пуст и `add_city` равен `false`, возвращается `422 invalid_params` с `field: text`.
-        position:
-          type: string
-          enum: [bottom, top]
-          default: bottom
-        add_city:
-          type: boolean
-          default: false
-          description: |
-            При `true` и корректных GPS-координатах в фото подпись начинается с «Привет из <город>».
-            Если города нет, Job всё равно завершается в `done` с предупреждением `geocoder_unavailable` или `location_missing`.
-
-    FilterOperation:
-      type: object
-      required: [operation, params]
-      additionalProperties: false
-      properties:
-        operation:
-          type: string
-          enum: [filter]
-        params:
-          $ref: '#/components/schemas/FilterParams'
-    FilterParams:
-      type: object
-      additionalProperties: false
-      required: [name]
-      properties:
-        name:
-          type: string
-          enum: [sepia, grayscale]
-
-    StampOperation:
-      type: object
-      required: [operation]
-      additionalProperties: false
-      properties:
-        operation:
-          type: string
-          enum: [stamp]
-        params:
-          $ref: '#/components/schemas/StampParams'
-    StampParams:
-      type: object
-      additionalProperties: false
-      properties:
-        style:
-          type: string
-          enum: [stamp, postmark]
-          default: stamp
-          description: stamp — прямоугольная марка, postmark — круглый штемпель с датой
-        position:
-          type: string
-          enum: [top_right, top_left, bottom_right, bottom_left]
-          default: top_right
-
-    Health:
-      type: object
-      required: [status, checks]
-      properties:
-        status:
-          type: string
-          enum: [ok, unavailable]
-        checks:
-          type: object
-          required: [database, storage]
-          properties:
-            database:
-              type: string
-              enum: [ok, unavailable]
-            storage:
-              type: string
-              enum: [ok, unavailable]
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Postcard Service API",
+    "version": "0.4.0",
+    "description": "p4 implements frame/filter. Other planned tools remain deferred. PNG inputs/results are persisted as SQLite BLOBs for atomic publication."
+  },
+  "paths": {
+    "/jobs": {
+      "post": {
+        "responses": {
+          "400": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "411": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Create or replay a background Job",
+        "description": "First request: 202 + Location. Replay: 200 + Idempotent-Replayed: true, current Job. Key TTL: 24 hours. Conflict: 409. JPEG/PNG <=10 MiB, <=25 megapixels; operations JSON <=16 KiB, 1..10 items. Content-Length required; chunked upload unsupported. Receive deadline: 30s. No authentication; knowledge of a random Job id grants access.",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{8,64}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "image": {
+                    "type": "string",
+                    "format": "binary"
+                  },
+                  "operations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 10,
+                    "items": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "operation": {
+                              "const": "frame"
+                            },
+                            "params": {
+                              "type": "object",
+                              "properties": {
+                                "style": {
+                                  "enum": [
+                                    "thin",
+                                    "classic"
+                                  ]
+                                },
+                                "width": {
+                                  "type": "integer",
+                                  "minimum": 1,
+                                  "maximum": 15
+                                },
+                                "color": {
+                                  "type": "string",
+                                  "pattern": "^#[0-9A-Fa-f]{6}$"
+                                }
+                              },
+                              "required": [],
+                              "additionalProperties": false
+                            }
+                          },
+                          "required": [
+                            "operation"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "operation": {
+                              "const": "filter"
+                            },
+                            "params": {
+                              "type": "object",
+                              "properties": {
+                                "name": {
+                                  "enum": [
+                                    "sepia",
+                                    "grayscale"
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "name"
+                              ],
+                              "additionalProperties": false
+                            }
+                          },
+                          "required": [
+                            "operation",
+                            "params"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "image",
+                  "operations"
+                ],
+                "additionalProperties": false
+              },
+              "encoding": {
+                "operations": {
+                  "contentType": "application/json"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/jobs/{jobId}": {
+      "get": {
+        "responses": {
+          "400": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "411": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "jobId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^j_[0-9a-f]{32}$"
+          }
+        }
+      ]
+    },
+    "/jobs/{jobId}/result": {
+      "get": {
+        "responses": {
+          "400": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "411": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "PNG result",
+            "content": {
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "jobId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^j_[0-9a-f]{32}$"
+          }
+        }
+      ]
+    },
+    "/jobs/{jobId}/cancel": {
+      "post": {
+        "responses": {
+          "400": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "411": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "jobId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^j_[0-9a-f]{32}$"
+          }
+        }
+      ]
+    },
+    "/health": {
+      "get": {
+        "responses": {
+          "400": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "411": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "details": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "details"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "const": "ok"
+                    },
+                    "checks": {
+                      "type": "object",
+                      "properties": {
+                        "database": {
+                          "const": "ok"
+                        },
+                        "storage": {
+                          "const": "ok"
+                        }
+                      },
+                      "required": [
+                        "database",
+                        "storage"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "checks"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Job": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^j_[0-9a-f]{32}$"
+          },
+          "status": {
+            "enum": [
+              "created",
+              "running",
+              "done",
+              "failed",
+              "cancelled"
+            ]
+          },
+          "operations": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 10,
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "operation": {
+                      "const": "frame"
+                    },
+                    "params": {
+                      "type": "object",
+                      "properties": {
+                        "style": {
+                          "enum": [
+                            "thin",
+                            "classic"
+                          ]
+                        },
+                        "width": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 15
+                        },
+                        "color": {
+                          "type": "string",
+                          "pattern": "^#[0-9A-Fa-f]{6}$"
+                        }
+                      },
+                      "required": [],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "operation"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "operation": {
+                      "const": "filter"
+                    },
+                    "params": {
+                      "type": "object",
+                      "properties": {
+                        "name": {
+                          "enum": [
+                            "sepia",
+                            "grayscale"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "name"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "operation",
+                    "params"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            }
+          },
+          "cancel_requested": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "finished_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "result_expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "code": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  },
+                  "details": {
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "code",
+                  "message",
+                  "details"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "code",
+                "message"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "operations",
+          "cancel_requested",
+          "created_at",
+          "started_at",
+          "finished_at",
+          "updated_at",
+          "result_expires_at",
+          "error",
+          "warnings"
+        ],
+        "additionalProperties": false
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "details": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "details"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+}
